@@ -1,139 +1,117 @@
-"""
-ShivaTube ➜ Telegram Bot
----------------------------------
-Commands:
-    /add <YouTube-URL> [quality] [channel]
-        quality  : 360p 480p 720p 1080p 2k 4k  (default best≤2 GB)
-        channel  : -100123…  या  @username  (optional)
+import os
+import logging
+import tempfile
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
 
-Env-Vars required on Render (or any host):
-    BOT_TOKEN         = Telegram bot token  ("12345:ABC…")
-    ALLOWED_CHANNELS  = comma-separated list → -1002566377076,@mychannel
-    MAX_FILESIZE      = (optional) bytes limit, default 2 GB
-"""
+# ── Render के फ़्री Web-Service पर port-scan टालने के लिए ──
+os.environ["PORT"] = "10000"
 
-import os, logging, tempfile
-from telegram.ext import Updater, CommandHandler
-from yt_dlp import YoutubeDL
-
-# ───────────────────────────────────────────────────────────
-# 1️⃣  CONFIG
-# ───────────────────────────────────────────────────────────
+# ── ENV VARIABLES ─────────────────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN env-var missing!")
 
-ALLOWED = []
-for part in os.getenv("ALLOWED_CHANNELS", "").split(","):
-    part = part.strip()
-    if not part:
-        continue
-    if part.lstrip("-").isdigit():
-        ALLOWED.append(int(part))
-    else:
-        if not part.startswith("@"):
-            part = "@" + part
-        ALLOWED.append(part)
+ALLOWED_CHANNELS = os.getenv("ALLOWED_CHANNELS", "").split(",")
+MAX_SIZE_MB = 1900  # 1.9 GB (Telegram hard-limit≈2 GB)
 
-MAX_SIZE = int(os.getenv("MAX_FILESIZE", "2000000000"))  # 2 GB default
-
-QUALITY_FMT = {
-    "360p":  "bestvideo[height<=360]+bestaudio/best[height<=360]",
-    "480p":  "bestvideo[height<=480]+bestaudio/best[height<=480]",
-    "720p":  "bestvideo[height<=720]+bestaudio/best[height<=720]",
-    "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-    "2k":    "bestvideo[height<=1440]+bestaudio/best[height<=1440]",
-    "4k":    "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
+QUALITY_MAP = {
+    "360p": 360,
+    "480p": 480,
+    "720p": 720,
+    "1080p": 1080,
+    "2k": 1440,
+    "4k": 2160,
 }
 
+# ── LOGGING ────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
+log = logging.getLogger("ShivaBot")
 
-# ───────────────────────────────────────────────────────────
-# 2️⃣  HELPERS
-# ───────────────────────────────────────────────────────────
-def pick_channel(arg: str):
-    if arg.lstrip("-").isdigit():
-        cid = int(arg)
-        return cid if cid in ALLOWED else None
-    if not arg.startswith("@"):
-        arg = "@" + arg
-    return arg if arg in ALLOWED else None
+# ── HELPERS ────────────────────────────────────────────────
+def build_yt_command(url: str, height: int) -> str:
+    fmt = f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    return (
+        f'yt-dlp --geo-bypass --geo-bypass-country US '
+        f'--cookies cookies.txt -f "{fmt}" '
+        f'-o "%(title)s.%(ext)s" "{url}"'
+    )
 
+def channel_allowed(chat_id: int | str) -> bool:
+    return not ALLOWED_CHANNELS or str(chat_id) in ALLOWED_CHANNELS
 
-def pick_quality(arg: str):
-    key = arg.lower().rstrip("p")
-    if key in QUALITY_FMT:
-        return QUALITY_FMT[key]
-    if key + "p" in QUALITY_FMT:
-        return QUALITY_FMT[key + "p"]
-    return None
+# ── BOT COMMANDS ───────────────────────────────────────────
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Hi! Use /add <YouTube-URL> <quality>\n"
+        "Example: /add https://youtu.be/dQw4w9WgXcQ 480p"
+    )
 
-
-# ───────────────────────────────────────────────────────────
-# 3️⃣  /add  COMMAND
-# ───────────────────────────────────────────────────────────
-def add(update, ctx):
-    if not ctx.args:
-        update.message.reply_text("Usage: /add <YouTube-URL> [quality] [channel]")
+async def add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not channel_allowed(chat_id):
+        await update.message.reply_text("⛔ You’re not allowed to use this bot.")
         return
 
-    url = ctx.args[0]
-    q_expr = None
-    target = ALLOWED[0] if ALLOWED else update.effective_chat.id
-
-    # बाकी arguments से quality / channel निकालो
-    for arg in ctx.args[1:]:
-        q = pick_quality(arg)
-        if q:
-            q_expr = q
-            continue
-        ch = pick_channel(arg)
-        if ch is not None:
-            target = ch
-            continue
-        update.message.reply_text(f"Unrecognised arg: {arg}")
+    if len(ctx.args) < 2:
+        await update.message.reply_text("⚠️ Usage: /add <url> <quality>")
         return
 
-    update.message.reply_text("⏬ Downloading…")
+    url, quality_arg = ctx.args[0], ctx.args[1].lower()
+    height = QUALITY_MAP.get(quality_arg.rstrip("p"))
+    if not height:
+        await update.message.reply_text("❌ Unsupported quality.")
+        return
 
-    ydl_opts = {
-        "format": q_expr or f"best[filesize<={MAX_SIZE}]/best",
-        "outtmpl": os.path.join(tempfile.gettempdir(), "%(title)s.%(ext)s"),
-        "quiet": True,
-        # geo-unlock
-        "geo_bypass": True,
-        "geo_bypass_country": "US",
-    }
+    await update.message.reply_text("📥 Downloading…")
+    cmd = build_yt_command(url, height)
+    log.info("Running: %s", cmd)
+    code = os.system(cmd)
 
+    # find downloaded file
+    video_path = None
+    for f in os.listdir("."):
+        if f.endswith((".mp4", ".mkv", ".webm")):
+            video_path = f
+            break
+
+    if code != 0 or not video_path:
+        await update.message.reply_text("❌ Download failed or blocked.")
+        return
+
+    # size check
+    if os.path.getsize(video_path) > MAX_SIZE_MB * 1024 * 1024:
+        await update.message.reply_text("❌ File too big for Telegram.")
+        os.remove(video_path)
+        return
+
+    await update.message.reply_text("📤 Uploading…")
     try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            file_path = ydl.prepare_filename(info)
+        with open(video_path, "rb") as vid:
+            await ctx.bot.send_video(chat_id=chat_id, video=vid)
+        await update.message.reply_text("✅ Done!")
     except Exception as e:
-        update.message.reply_text(f"❌ Error: {e}")
-        return
+        await update.message.reply_text(f"❌ Upload error: {e}")
+    finally:
+        if os.path.exists(video_path):
+            os.remove(video_path)
 
-    title = info.get("title", "Video")
-    update.message.reply_text(f"📤 Uploading to {target} …")
-    with open(file_path, "rb") as vid:
-        ctx.bot.send_video(chat_id=target, video=vid, caption=title)
-    update.message.reply_text("✅ Done!")
-
-
-# ───────────────────────────────────────────────────────────
-# 4️⃣  MAIN
-# ───────────────────────────────────────────────────────────
+# ── MAIN ───────────────────────────────────────────────────
 def main():
-    logging.info("Allowed channels: %s", ALLOWED or "ALL (no env set)")
-    up = Updater(BOT_TOKEN, use_context=True)
-    up.dispatcher.add_handler(CommandHandler("add", add))
-    up.start_polling()
-    logging.info("Bot started")
-    up.idle()
-
+    log.info("Allowed channels: %s", ALLOWED_CHANNELS or "ALL")
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("add", add))
+    log.info("Bot started")
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
+
